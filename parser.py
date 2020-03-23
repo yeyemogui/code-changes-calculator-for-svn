@@ -10,11 +10,12 @@ from multiprocessing import pool
 from multiprocessing.dummy import Pool as ThreadPool
 
 class SvnLogKit:
-    def __init__(self, svnOptions, svnRepoAddr, nameList, logDirectory, diffDirectory, threadNum):
+    def __init__(self, svnOptions, svnRepoAddr, nameList, logDirectory, diffDirectory, processNum, featureList):
+        self.featureList = featureList
         self.svnRepoAddr = svnRepoAddr
         self.nameList = nameList
         self.logDirectory = logDirectory
-        self.threadNum = threadNum
+        self.processNum = processNum
         if not os.path.isdir(logDirectory):
             os.mkdir(logDirectory)
         self.svnLogName = logDirectory + '/' + r'svnLog.log'
@@ -27,7 +28,6 @@ class SvnLogKit:
         self.diffDirectory = diffDirectory
         if not os.path.isdir(diffDirectory):
             os.mkdir(diffDirectory)
-        self.threadId = 0
 
     def createSvnLog(self):
         cmd = "svn log" + " " + self.svnOptions + " " + self.svnRepoAddr + ">" + self.svnLogName
@@ -66,10 +66,23 @@ class SvnLogKit:
                 ignoreList.append(info)
         return ignoreList
 
-    def isIgnored(self, change):
+    def isDataWithinChecklist(self, data, checkList):
+        if checkList is not None:
+            return data in checkList
+        return True
+
+    def getFeature(self, change):
+        if self.featureList is None:
+            return "FULL"
         msg = change.getElementsByTagName("msg")[0].childNodes[0].nodeValue
+        for feature in self.featureList:
+            if feature in msg:
+                return feature
+        return None
+
+    def isIgnored(self, change):
         name = change.getElementsByTagName("author")[0].childNodes[0].nodeValue
-        if str(self.getRevision(change)) in self.ignoreList or name not in self.nameList:
+        if str(self.getRevision(change)) in self.ignoreList or not self.isDataWithinChecklist(name, self.nameList) or self.getFeature(change) is None:
             return True
         return False
 
@@ -93,52 +106,71 @@ class SvnLogKit:
         return changedLines
 
     def calculateTotalChangedLines(self):
-        totalLines = 0
+        totalLines = self.getFeatureDic(True)
         changeDic = self.CalculateLineChangesByAuthor()
-        for value in changeDic.values():
-            totalLines += value
+        print("start calculate total lines...")
+        for key in changeDic.keys():
+            for value in changeDic[key].values():
+                totalLines[key] += value
+        print("finish calculate total lines")
         return totalLines
 
     def calculateChangeLinesMap(self, change):
-        self.threadId += 1
-        print("Thread " + str(self.threadId) +  " "  + "created")
         if not self.isIgnored(change):
             author = self.getAuthor(change)
+            feature = self.getFeature(change)
             changedLines = self.calculateChangedLines(change)
-            print("Thread " + str(self.threadId) + " " + "finished")
-            return [author, changedLines]
+            return [feature, author, changedLines]
         else:
-            print("Thread " + str(self.threadId) + " " + "finished")
             return None
 
     def getAuthorDic(self):
+        if self.nameList is None:
+            return {}
         authorDic = {}
         for author in self.nameList:
             if author not in authorDic.keys():
                 authorDic.setdefault(author, 0)
         return authorDic
 
+    def getFeatureDic(self, isTotalLines = False):
+        featureDic = {}
+        if self.featureList is None:
+            featureDic.setdefault("FULL", 0 if isTotalLines else self.getAuthorDic())
+        else:
+            for feature in self.featureList:
+                featureDic.setdefault(feature, 0 if isTotalLines else self.getAuthorDic())
+        return featureDic
+
     def CalculateLineChangesByAuthor(self):
-        pool = ThreadPool(self.threadNum)
+        pool = ThreadPool(self.processNum)
+        print("start process svn changes...")
         result = list(pool.map(self.calculateChangeLinesMap, self.changes))
+        print("finish process svn changes")
         pool.close()
         pool.join()
-        totalLines = self.getAuthorDic()
+        totalLines = self.getFeatureDic()
+        print("start re-org data by author...")
         for item in result:
             if item is not None:
-                totalLines[item[0]] += item[1]
+                if item[1] not in totalLines[item[0]].keys():
+                    totalLines[item[0]].setdefault(item[1], 0)
+                totalLines[item[0]][item[1]] += item[2]
+        print("finished data re-org")
         return totalLines
-class ToolKit:
+class ToolKit:  
     @staticmethod
-    def getNameList(fileName):
-        nameList = []
+    def getFileContent(fileName):
+        if fileName is None:
+            return None
+        content = []
         f = open(fileName, 'r')
-        print("Will cauculate data for below authors:")
+        print("The content within " + fileName + " is:")
         for line in f.readlines():
             print(line.strip("\n"))
-            nameList.append(line.strip("\n"))
+            content.append(line.strip("\n"))
         f.close()
-        return nameList
+        return content
 
     @staticmethod
     def calculateChangedLines(diffFile):
@@ -185,7 +217,8 @@ class ToolKit:
         parser.add_option("-s", "--svnRepo", action = "store", dest = "svnRepo", help = "svn repo address")
         parser.add_option("-n", "--nameList", action = "store", dest = "nameList", help = "file which stores the name list")
         parser.add_option("-a", "--byAuthor", action = "store_true", dest = "byAuthor", help = "calculate by authors")
-        parser.add_option("-j", "--threadNum", action = "store", dest = "threadNum", default = "32", help = "thread number in pool, default value is 32")
+        parser.add_option("-j", "--processNum", action = "store", dest = "processNum", default = "32", help = "max concurrency processes number, default value is 32")
+        parser.add_option("-f", "--featureList", action = "store", dest = "featureList", help = "file which stores the feature list")
         return parser
 
     @staticmethod
@@ -203,24 +236,30 @@ if __name__ == "__main__":
     svnOptions = "-v --xml -r" + " " + options.duration
 
     if options.creatNameList is not None:
-        logKit = SvnLogKit(svnOptions, options.svnRepo, None, options.logDirectory, None, int(options.threadNum))
+        logKit = SvnLogKit(svnOptions, options.svnRepo, None, options.logDirectory, None, int(options.processNum), None)
         fullNameListFile = options.logDirectory + r"/" + options.creatNameList
         logKit.getFullNameList(fullNameListFile)
         sys.exit(1)
 
     nameListFile = options.nameList
-    if nameListFile is None:
-        raise Exception("no name list identified, please use --help")
-    nameList = ToolKit.getNameList(nameListFile)
-    logKit = SvnLogKit(svnOptions, options.svnRepo, nameList, options.logDirectory, options.diffDirectory, int(options.threadNum))
+    nameList = ToolKit.getFileContent(nameListFile)
+
+    featureList = None
+    if options.featureList is not None:
+        featureList = ToolKit.getFileContent(options.featureList)
+    
+    logKit = SvnLogKit(svnOptions, options.svnRepo, nameList, options.logDirectory, options.diffDirectory, int(options.processNum), featureList)
     if not options.byAuthor:
         totalLines = logKit.calculateTotalChangedLines()
-        print("Total Changed Lines is: " + str(totalLines))
+        print("Total Changed Lines is:")
+        for key, value in totalLines.items():
+            print(key + ': ' + str(value))
     else:
         totalLines = logKit.CalculateLineChangesByAuthor()
         print("The changed Lines by Authors are:")
-        for key, value in totalLines.items():
-            print(key + ': ' + str(value))
+        for key1 in totalLines.keys():
+            for key, value in totalLines[key1].items():
+                print(key1 + ': ' + key + ': ' + str(value))
     
     end_time = time()
     run_time = end_time-begin_time
